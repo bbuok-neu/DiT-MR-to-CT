@@ -29,7 +29,7 @@ import os
 from accelerate import Accelerator
 from timm.models.vision_transformer import PatchEmbed
 
-from models import DiT_models, DiT
+from models import DiT_models, DiT_MR_CT, load_pretrained_mr_ct
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 
@@ -160,86 +160,6 @@ class MRCTDataset(Dataset):
         return mr_tensor, ct_tensor
 
 
-def create_mr_ct_dit(
-    pretrained_path=None,
-    input_size=32,
-    patch_size=2,
-    hidden_size=1152,
-    depth=28,
-    num_heads=16,
-    mlp_ratio=4.0,
-    learn_sigma=True,
-):
-    """
-    Create a DiT model for MR-to-CT synthesis with 8-channel input.
-    
-    The model concatenates noisy CT latent (4 channels) with MR latent (4 channels)
-    as input. The pretrained weights for the first 4 channels are loaded from the
-    pretrained model, while the MR channel weights are initialized to zero.
-    
-    Args:
-        pretrained_path: Path to pretrained DiT checkpoint
-        input_size: Latent image size (image_size // 8)
-        patch_size: Patch size for ViT
-        hidden_size: Hidden dimension
-        depth: Number of transformer blocks
-        num_heads: Number of attention heads
-        mlp_ratio: MLP hidden dim ratio
-        learn_sigma: Whether to learn variance
-        
-    Returns:
-        DiT model with 8-channel input
-    """
-    # Create model with 8 input channels (4 for noisy CT + 4 for MR condition)
-    model = DiT(
-        input_size=input_size,
-        patch_size=patch_size,
-        in_channels=8,  # 4 (noisy CT latent) + 4 (MR latent)
-        hidden_size=hidden_size,
-        depth=depth,
-        num_heads=num_heads,
-        mlp_ratio=mlp_ratio,
-        class_dropout_prob=0.0,  # No class dropout for image-conditioned generation
-        num_classes=1,  # Single class (we use MR image as condition instead)
-        learn_sigma=learn_sigma,
-    )
-    
-    if pretrained_path is not None:
-        # Load pretrained weights
-        checkpoint = torch.load(pretrained_path, map_location='cpu')
-        if "ema" in checkpoint:
-            pretrained_state = checkpoint["ema"]
-        elif "model" in checkpoint:
-            pretrained_state = checkpoint["model"]
-        else:
-            pretrained_state = checkpoint
-        
-        # Get model state dict
-        model_state = model.state_dict()
-        
-        # Handle x_embedder.proj (PatchEmbed) - expand from 4 to 8 input channels
-        if 'x_embedder.proj.weight' in pretrained_state:
-            pretrained_embed_weight = pretrained_state['x_embedder.proj.weight']  # (hidden_size, 4, patch_size, patch_size)
-            # Create new weight tensor with zeros for MR channels
-            new_embed_weight = torch.zeros_like(model_state['x_embedder.proj.weight'])
-            # Copy pretrained weights for first 4 channels (noisy CT)
-            new_embed_weight[:, :4, :, :] = pretrained_embed_weight
-            # MR channels (last 4) remain zero-initialized
-            pretrained_state['x_embedder.proj.weight'] = new_embed_weight
-        
-        # Handle y_embedder (class embedding) - we don't use class labels
-        # Just remove it from pretrained state if dimensions don't match
-        if 'y_embedder.embedding_table.weight' in pretrained_state:
-            del pretrained_state['y_embedder.embedding_table.weight']
-        
-        # Load the modified state dict
-        missing_keys, unexpected_keys = model.load_state_dict(pretrained_state, strict=False)
-        print(f"Loaded pretrained weights. Missing keys: {missing_keys}")
-        print(f"Unexpected keys: {unexpected_keys}")
-    
-    return model
-
-
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
@@ -286,14 +206,24 @@ def main(args):
     }
     
     config = model_config[args.model]
-    model = create_mr_ct_dit(
-        pretrained_path=args.pretrained,
+    
+    # Create DiT_MR_CT model
+    model = DiT_MR_CT(
         input_size=latent_size,
         patch_size=config['patch_size'],
+        in_channels=8,  # 4 noisy CT + 4 MR
+        out_channels_base=4,  # CT latent has 4 channels
         hidden_size=config['hidden_size'],
         depth=config['depth'],
         num_heads=config['num_heads'],
     )
+    
+    # Load pretrained weights if provided
+    if args.pretrained:
+        if accelerator.is_main_process:
+            logger.info(f"Loading pretrained weights from {args.pretrained}")
+        model = load_pretrained_mr_ct(model, args.pretrained)
+    
     model = model.to(device)
     ema = deepcopy(model).to(device)
     requires_grad(ema, False)
@@ -361,9 +291,6 @@ def main(args):
             # Sample timesteps
             t = torch.randint(0, diffusion.num_timesteps, (ct_latent.shape[0],), device=device)
             
-            # Create dummy labels (we use MR as condition instead of class labels)
-            y = torch.zeros(ct_latent.shape[0], dtype=torch.long, device=device)
-            
             # Add noise to CT latent
             noise = torch.randn_like(ct_latent)
             noisy_ct_latent = diffusion.q_sample(ct_latent, t, noise=noise)
@@ -372,8 +299,8 @@ def main(args):
             # Shape: (B, 8, H, W)
             x_input = torch.cat([noisy_ct_latent, mr_latent], dim=1)
             
-            # Forward pass
-            model_output = model(x_input, t, y)
+            # Forward pass (DiT_MR_CT only takes x and t, no class labels)
+            model_output = model(x_input, t)
             
             # Compute loss (predicting noise)
             # Model outputs 8 channels: 4 for epsilon, 4 for variance

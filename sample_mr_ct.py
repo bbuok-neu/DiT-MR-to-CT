@@ -19,7 +19,7 @@ import os
 import argparse
 from tqdm import tqdm
 
-from models import DiT
+from models import DiT_MR_CT
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 
@@ -109,59 +109,6 @@ class MRCTTestDataset(Dataset):
         return mr_tensor, ct_tensor, self.mr_files[idx]
 
 
-def create_mr_ct_dit_for_inference(
-    checkpoint_path,
-    input_size=32,
-    patch_size=2,
-    hidden_size=1152,
-    depth=28,
-    num_heads=16,
-    mlp_ratio=4.0,
-    learn_sigma=True,
-):
-    """
-    Create a DiT model for MR-to-CT synthesis inference.
-    
-    Args:
-        checkpoint_path: Path to trained checkpoint
-        input_size: Latent image size (image_size // 8)
-        patch_size: Patch size for ViT
-        hidden_size: Hidden dimension
-        depth: Number of transformer blocks
-        num_heads: Number of attention heads
-        mlp_ratio: MLP hidden dim ratio
-        learn_sigma: Whether variance is learned
-        
-    Returns:
-        DiT model with loaded weights
-    """
-    # Create model with 8 input channels
-    model = DiT(
-        input_size=input_size,
-        patch_size=patch_size,
-        in_channels=8,
-        hidden_size=hidden_size,
-        depth=depth,
-        num_heads=num_heads,
-        mlp_ratio=mlp_ratio,
-        class_dropout_prob=0.0,
-        num_classes=1,
-        learn_sigma=learn_sigma,
-    )
-    
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    if "ema" in checkpoint:
-        state_dict = checkpoint["ema"]
-    elif "model" in checkpoint:
-        state_dict = checkpoint["model"]
-    else:
-        state_dict = checkpoint
-    
-    model.load_state_dict(state_dict)
-    return model
-
-
 def denormalize_ct(ct_tensor, ct_mean, ct_std):
     """
     Denormalize CT tensor from z-score normalized values back to [0, 1] range.
@@ -207,14 +154,28 @@ def main(args):
     }
     
     config = model_config[args.model]
-    model = create_mr_ct_dit_for_inference(
-        checkpoint_path=args.ckpt,
+    
+    # Create DiT_MR_CT model
+    model = DiT_MR_CT(
         input_size=latent_size,
         patch_size=config['patch_size'],
+        in_channels=8,  # 4 noisy CT + 4 MR
+        out_channels_base=4,  # CT latent has 4 channels
         hidden_size=config['hidden_size'],
         depth=config['depth'],
         num_heads=config['num_heads'],
-    ).to(device)
+    )
+    
+    # Load checkpoint
+    checkpoint = torch.load(args.ckpt, map_location='cpu')
+    if "ema" in checkpoint:
+        state_dict = checkpoint["ema"]
+    elif "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+    model.load_state_dict(state_dict)
+    model = model.to(device)
     model.eval()
     
     diffusion = create_diffusion(str(args.num_sampling_steps))
@@ -259,24 +220,20 @@ def main(args):
         # Create initial noise for CT latent
         z = torch.randn(batch_size, 4, latent_size, latent_size, device=device)
         
-        # Create dummy labels
-        y = torch.zeros(batch_size, dtype=torch.long, device=device)
-        
         # Custom forward function that concatenates MR latent with noisy CT latent
-        def model_forward(x, t, y):
+        def model_forward(x, t, **kwargs):
             # x is the noisy CT latent (4 channels)
             # Concatenate with MR latent to get 8-channel input
             x_input = torch.cat([x, mr_latent], dim=1)
-            return model(x_input, t, y)
+            return model(x_input, t)
         
         # Sample CT latent using diffusion
-        model_kwargs = dict(y=y)
         samples = diffusion.p_sample_loop(
             model_forward, 
             z.shape, 
             z, 
             clip_denoised=False, 
-            model_kwargs=model_kwargs, 
+            model_kwargs={}, 
             progress=False, 
             device=device
         )
