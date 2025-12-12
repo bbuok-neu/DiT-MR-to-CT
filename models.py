@@ -398,6 +398,7 @@ class DiT_MR_CT(nn.Module):
         num_heads=16,
         mlp_ratio=4.0,
         learn_sigma=True,
+        gradient_checkpointing=True,  # Enable/disable gradient checkpointing
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -406,6 +407,7 @@ class DiT_MR_CT(nn.Module):
         self.out_channels = out_channels_base * 2 if learn_sigma else out_channels_base
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.gradient_checkpointing = gradient_checkpointing
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -482,7 +484,10 @@ class DiT_MR_CT(nn.Module):
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D)
         c = self.t_embedder(t)                   # (N, D) - only timestep conditioning
         for block in self.blocks:
-            x = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), x, c)
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), x, c, use_reentrant=False)
+            else:
+                x = block(x, c)
         x = self.final_layer(x, c)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x

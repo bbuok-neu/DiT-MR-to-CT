@@ -155,7 +155,7 @@ def main(args):
     
     config = model_config[args.model]
     
-    # Create DiT_MR_CT model
+    # Create DiT_MR_CT model (disable gradient checkpointing for inference)
     model = DiT_MR_CT(
         input_size=latent_size,
         patch_size=config['patch_size'],
@@ -164,6 +164,7 @@ def main(args):
         hidden_size=config['hidden_size'],
         depth=config['depth'],
         num_heads=config['num_heads'],
+        gradient_checkpointing=False,  # Disable for inference
     )
     
     # Load checkpoint
@@ -244,23 +245,21 @@ def main(args):
         # The VAE output is in [-1, 1] range, convert to [0, 1]
         samples = (samples + 1) / 2
         
-        # Take the first channel (grayscale) and denormalize
-        # Note: Since we used z-score normalized input to VAE, the output needs 
-        # to be interpreted as z-score normalized values
-        # For proper denormalization, we apply the inverse transformation
-        # Here we assume the VAE output is already in a reasonable range
-        samples_gray = samples.mean(dim=1, keepdim=True)  # Average RGB channels
+        # Convert RGB to grayscale using standard weights for better visual results
+        # Using standard weights: 0.299*R + 0.587*G + 0.114*B
+        rgb_weights = torch.tensor([0.299, 0.587, 0.114], device=device).view(1, 3, 1, 1)
+        samples_gray = (samples * rgb_weights).sum(dim=1, keepdim=True)
         samples_denorm = denormalize_ct(samples_gray, args.ct_mean, args.ct_std)
         
-        # Similarly process ground truth for comparison
-        ct_gt_decoded = vae.decode(vae.encode(ct_gt).latent_dist.sample().mul_(0.18215) / 0.18215).sample
-        ct_gt_vis = (ct_gt_decoded + 1) / 2
-        ct_gt_gray = ct_gt_vis.mean(dim=1, keepdim=True)
+        # Use the original CT image directly for comparison (already in z-score normalized form)
+        # Convert back to [0, 1] range for visualization
+        ct_gt_gray = ct_gt.mean(dim=1, keepdim=True)  # Average RGB channels
+        ct_gt_vis = denormalize_ct(ct_gt_gray, args.ct_mean, args.ct_std)
         
         # Process MR for visualization
         mr_decoded = vae.decode(mr_latent / 0.18215).sample
         mr_vis = (mr_decoded + 1) / 2
-        mr_gray = mr_vis.mean(dim=1, keepdim=True)
+        mr_gray = (mr_vis * rgb_weights).sum(dim=1, keepdim=True)
         
         # Save individual generated images
         for i in range(batch_size):
@@ -271,7 +270,7 @@ def main(args):
             save_image(samples_denorm[i], gen_path)
             
             # Save comparison (MR | Generated CT | Ground Truth CT)
-            comparison = torch.cat([mr_gray[i], samples_denorm[i], ct_gt_gray[i]], dim=2)
+            comparison = torch.cat([mr_gray[i], samples_denorm[i], ct_gt_vis[i]], dim=2)
             comp_path = os.path.join(args.output_dir, 'comparison', f'{filename}_comparison.png')
             save_image(comparison, comp_path)
             

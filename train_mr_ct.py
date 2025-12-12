@@ -27,7 +27,6 @@ import argparse
 import logging
 import os
 from accelerate import Accelerator
-from timm.models.vision_transformer import PatchEmbed
 
 from models import DiT_models, DiT_MR_CT, load_pretrained_mr_ct
 from diffusion import create_diffusion
@@ -322,11 +321,11 @@ def main(args):
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
+                
+                # Compute average loss across processes
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                avg_loss = avg_loss.item() / accelerator.num_processes
-
-                avg_loss = torch.tensor(avg_loss, device=accelerator.device)
                 avg_loss = accelerator.reduce(avg_loss, reduction="sum")
+                avg_loss = avg_loss.item() / accelerator.num_processes
 
                 if accelerator.is_main_process:
                     logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
