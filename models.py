@@ -374,3 +374,191 @@ DiT_models = {
     'DiT-B/2':  DiT_B_2,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
     'DiT-S/2':  DiT_S_2,   'DiT-S/4':  DiT_S_4,   'DiT-S/8':  DiT_S_8,
 }
+
+
+#################################################################################
+#                         DiT for MR-to-CT Synthesis                            #
+#################################################################################
+
+class DiT_MR_CT(nn.Module):
+    """
+    Diffusion model with a Transformer backbone for MR-to-CT synthesis.
+    
+    This model takes concatenated (noisy CT latent + MR latent) as input (8 channels)
+    and outputs CT latent prediction (4 channels for epsilon, 4 for learned sigma).
+    """
+    def __init__(
+        self,
+        input_size=32,
+        patch_size=2,
+        in_channels=8,  # 4 (noisy CT) + 4 (MR condition)
+        out_channels_base=4,  # CT latent has 4 channels
+        hidden_size=1152,
+        depth=28,
+        num_heads=16,
+        mlp_ratio=4.0,
+        learn_sigma=True,
+        gradient_checkpointing=True,  # Enable/disable gradient checkpointing
+    ):
+        super().__init__()
+        self.learn_sigma = learn_sigma
+        self.in_channels = in_channels
+        self.out_channels_base = out_channels_base
+        self.out_channels = out_channels_base * 2 if learn_sigma else out_channels_base
+        self.patch_size = patch_size
+        self.num_heads = num_heads
+        self.gradient_checkpointing = gradient_checkpointing
+
+        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        num_patches = self.x_embedder.num_patches
+        # Will use fixed sin-cos embedding:
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+        self.blocks = nn.ModuleList([
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+        ])
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Initialize (and freeze) pos_embed by sin-cos embedding:
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
+
+        # Initialize timestep embedding MLP:
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        # Zero-out adaLN modulation layers in DiT blocks:
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        # Zero-out output layers:
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def unpatchify(self, x):
+        """
+        x: (N, T, patch_size**2 * C)
+        imgs: (N, H, W, C)
+        """
+        c = self.out_channels
+        p = self.x_embedder.patch_size[0]
+        h = w = int(x.shape[1] ** 0.5)
+        assert h * w == x.shape[1]
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        return imgs
+    
+    def ckpt_wrapper(self, module):
+        def ckpt_forward(*inputs):
+            outputs = module(*inputs)
+            return outputs
+        return ckpt_forward
+
+    def forward(self, x, t):
+        """
+        Forward pass of DiT for MR-to-CT.
+        x: (N, 8, H, W) tensor - concatenated noisy CT latent (4ch) + MR latent (4ch)
+        t: (N,) tensor of diffusion timesteps
+        """
+        x = self.x_embedder(x) + self.pos_embed  # (N, T, D)
+        c = self.t_embedder(t)                   # (N, D) - only timestep conditioning
+        for block in self.blocks:
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), x, c, use_reentrant=False)
+            else:
+                x = block(x, c)
+        x = self.final_layer(x, c)
+        x = self.unpatchify(x)                   # (N, out_channels, H, W)
+        return x
+
+
+def load_pretrained_mr_ct(model, pretrained_path):
+    """
+    Load pretrained DiT weights into DiT_MR_CT model.
+    
+    The first 4 input channels (noisy CT) use pretrained weights.
+    The last 4 input channels (MR condition) are initialized to zero.
+    
+    Args:
+        model: DiT_MR_CT model instance
+        pretrained_path: Path to pretrained DiT checkpoint
+        
+    Returns:
+        model with loaded weights
+    """
+    # Load pretrained weights
+    checkpoint = torch.load(pretrained_path, map_location='cpu')
+    if "ema" in checkpoint:
+        pretrained_state = checkpoint["ema"]
+    elif "model" in checkpoint:
+        pretrained_state = checkpoint["model"]
+    else:
+        pretrained_state = checkpoint
+    
+    # Get model state dict
+    model_state = model.state_dict()
+    
+    # Create new state dict for loading
+    new_state = {}
+    
+    for key, value in pretrained_state.items():
+        if key not in model_state:
+            print(f"Skipping key not in model: {key}")
+            continue
+            
+        if key == 'x_embedder.proj.weight':
+            # Expand from 4 to 8 input channels
+            # pretrained: (hidden_size, 4, patch_size, patch_size)
+            # target: (hidden_size, 8, patch_size, patch_size)
+            new_weight = torch.zeros_like(model_state[key])
+            new_weight[:, :4, :, :] = value  # Copy pretrained weights for CT channels
+            # MR channels (last 4) remain zero
+            new_state[key] = new_weight
+            print(f"Expanded {key}: {value.shape} -> {new_weight.shape}")
+        elif key == 'final_layer.linear.weight':
+            # Output layer: pretrained outputs 8 channels, we also output 8
+            # pretrained: (patch_size^2 * 8, hidden_size)
+            # target: (patch_size^2 * 8, hidden_size) - same shape
+            if value.shape == model_state[key].shape:
+                new_state[key] = value
+            else:
+                print(f"Skipping {key} due to shape mismatch: {value.shape} vs {model_state[key].shape}")
+        elif key == 'final_layer.linear.bias':
+            # Same for bias
+            if value.shape == model_state[key].shape:
+                new_state[key] = value
+            else:
+                print(f"Skipping {key} due to shape mismatch: {value.shape} vs {model_state[key].shape}")
+        elif model_state[key].shape == value.shape:
+            new_state[key] = value
+        else:
+            print(f"Skipping {key} due to shape mismatch: {value.shape} vs {model_state[key].shape}")
+    
+    # Load the new state dict
+    missing_keys, unexpected_keys = model.load_state_dict(new_state, strict=False)
+    print(f"\nLoaded {len(new_state)} keys from pretrained checkpoint")
+    print(f"Missing keys: {missing_keys}")
+    print(f"Unexpected keys: {unexpected_keys}")
+    
+    return model
