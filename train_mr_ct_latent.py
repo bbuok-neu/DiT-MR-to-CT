@@ -171,8 +171,8 @@ def main(args):
         num_heads=config['num_heads'],
     )
     
-    # Load pretrained weights if provided
-    if args.pretrained:
+    # Load pretrained weights if provided (for fine-tuning from scratch)
+    if args.pretrained and not args.resume:
         if accelerator.is_main_process:
             logger.info(f"Loading pretrained weights from {args.pretrained}")
         model = load_pretrained_mr_ct(model, args.pretrained)
@@ -188,6 +188,21 @@ def main(args):
 
     # Setup optimizer:
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
+    
+    # Resume from checkpoint if specified
+    train_steps = 0
+    if args.resume:
+        if accelerator.is_main_process:
+            logger.info(f"Resuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location='cpu')
+        model.load_state_dict(checkpoint["model"])
+        ema.load_state_dict(checkpoint["ema"])
+        opt.load_state_dict(checkpoint["opt"])
+        # Extract train_steps from checkpoint filename (format: 0000000.pt)
+        ckpt_name = os.path.basename(args.resume)
+        train_steps = int(ckpt_name.split('.')[0])
+        if accelerator.is_main_process:
+            logger.info(f"Resumed at step {train_steps}")
 
     # Setup data:
     dataset = MRCTLatentDataset(
@@ -206,13 +221,13 @@ def main(args):
         logger.info(f"Dataset contains {len(dataset):,} paired latent features ({args.features_path})")
 
     # Prepare models for training:
-    update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+    if not args.resume:
+        update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()
     ema.eval()
     model, opt, loader = accelerator.prepare(model, opt, loader)
 
     # Variables for monitoring/logging purposes:
-    train_steps = 0
     log_steps = 0
     running_loss = 0
     start_time = time()
@@ -297,7 +312,9 @@ if __name__ == "__main__":
     parser.add_argument("--features-path", type=str, required=True,
                         help="Path to pre-extracted features directory (from extract_features_mr_ct.py)")
     parser.add_argument("--pretrained", type=str, default=None,
-                        help="Path to pretrained DiT checkpoint")
+                        help="Path to pretrained DiT checkpoint (for fine-tuning from scratch)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume training from (restores model, ema, optimizer, and step count)")
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
